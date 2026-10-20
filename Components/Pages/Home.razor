@@ -1,0 +1,387 @@
+@page "/"
+@using System.Globalization
+@using Juleplanlaegning.Data
+@implements IAsyncDisposable
+@inject PlannerService Planner
+@inject IJSRuntime JS
+
+<PageTitle>Juleplanlægning</PageTitle>
+
+<div class="app">
+    <aside class="sidebar">
+        <h1>Juleplanlægning</h1>
+        <PageNav />
+
+        <section>
+            <h2>People</h2>
+            <form class="add-person" @onsubmit="AddPerson">
+                <input @bind="newPersonName" placeholder="Name" maxlength="200" />
+                <button type="submit" disabled="@string.IsNullOrWhiteSpace(newPersonName)">Add</button>
+            </form>
+            <input class="filter" @bind="filter" @bind:event="oninput" placeholder="Filter unplaced…" />
+
+            @* Drag-and-drop is handled in wwwroot/js/people-dnd.js, which calls DropPerson on drop. *@
+            <div class="people-list dropzone">
+                @foreach (var p in UnplacedPeople)
+                {
+                    <div class="chip" draggable="true" data-person-id="@p.Id">
+                        <span>@p.Name</span>
+                        <button class="chip-delete" title="Delete person" @onclick="() => DeletePerson(p.Id)">×</button>
+                    </div>
+                }
+                @if (!UnplacedPeople.Any())
+                {
+                    <p class="hint">@(people.Count == 0 ? "Add some people above." : "Everyone is placed. Drag people here to unplace them.")</p>
+                }
+            </div>
+        </section>
+
+        <section class="stats">
+            <div>Placed: <strong>@assignments.Count</strong> / @people.Count</div>
+            <div>Seats: <strong>@buckets.Sum(b => b.Capacity)</strong></div>
+            @if (OverfilledCount > 0)
+            {
+                <div class="warn">⚠ @OverfilledCount overfilled @(OverfilledCount == 1 ? "bucket" : "buckets")</div>
+            }
+        </section>
+
+        @if (editMode)
+        {
+            <section class="edit-panel">
+                <h2>Editing</h2>
+                <p class="hint">Drag on the map to draw a bucket. Drag a bucket to move it, its corner to resize it. Changes only affect this version.</p>
+                <label>Version name <input @bind="editPlanName" @bind:after="RenamePlan" maxlength="200" /></label>
+                <button class="danger" disabled="@(plans.Count <= 1)" @onclick="DeletePlan">Delete version</button>
+                <div class="button-row">
+                    <label class="button">
+                        @(imageVersion is null ? "Upload map image" : "Replace map image")
+                        <InputFile OnChange="UploadImage" accept="image/*" hidden />
+                    </label>
+                    @if (imageVersion is not null)
+                    {
+                        <button @onclick="ClearImage">Remove image</button>
+                    }
+                </div>
+                @if (errorMessage is not null)
+                {
+                    <span class="error">@errorMessage</span>
+                }
+            </section>
+        }
+
+        @if (editMode && SelectedBucket is { } sel)
+        {
+            <section class="bucket-editor">
+                <h2>Bucket</h2>
+                <label>Name <input @bind="editName" @bind:after="SaveBucketDetails" maxlength="200" /></label>
+                <label>Capacity <input type="number" min="0" @bind="editCapacity" @bind:after="SaveBucketDetails" /></label>
+                <label>Color <input type="color" @bind="editColor" @bind:after="SaveBucketDetails" /></label>
+                <button class="danger" @onclick="() => DeleteBucket(sel.Id)">Delete bucket</button>
+            </section>
+        }
+    </aside>
+
+    <main>
+        <nav class="plan-tabs">
+            @foreach (var plan in plans)
+            {
+                <button class="plan-tab @(plan.Id == planId ? "active" : "")" @onclick="() => SwitchPlan(plan.Id)">@plan.Name</button>
+            }
+            <button class="plan-tab add" title="Create a new version as a copy of the current one" @onclick="NewPlan">+ New version</button>
+        </nav>
+
+        @* Keep everything above the map the same in both modes, so the map never shifts while editing. *@
+        <div class="toolbar">
+            <button class="@(editMode ? "active" : "")" @onclick="ToggleEditMode">
+                @(editMode ? "Done editing" : "Edit buckets")
+            </button>
+        </div>
+
+        <div class="map @(editMode ? "editing" : "") @(imageVersion is null ? "no-image" : "")" @ref="mapElement">
+            @if (imageVersion is not null)
+            {
+                <img class="map-image" src="map-image?v=@imageVersion.Value.Ticks" draggable="false" alt="Map" />
+            }
+
+            @foreach (var b in buckets)
+            {
+                var members = people.Where(p => BucketOf(p) == b.Id).ToList();
+                var over = members.Count > b.Capacity;
+                var state = over ? "over" : members.Count == b.Capacity ? "full" : "";
+
+                <div class="bucket dropzone @state @(editMode && selectedBucketId == b.Id ? "selected" : "")"
+                     data-bucket-id="@b.Id"
+                     data-drop-id="@b.Id"
+                     style="left:@Pct(b.X);top:@Pct(b.Y);width:@Pct(b.Width);height:@Pct(b.Height);--bucket-color:@b.Color">
+                    <div class="bucket-header">
+                        <span class="bucket-name">@b.Name</span>
+                        <span class="bucket-count">@members.Count / @b.Capacity</span>
+                    </div>
+                    @if (over)
+                    {
+                        <div class="bucket-warning">⚠ Overfilled by @(members.Count - b.Capacity)</div>
+                    }
+                    <div class="bucket-people">
+                        @foreach (var p in members)
+                        {
+                            <div class="chip" draggable="true" data-person-id="@p.Id">@p.Name</div>
+                        }
+                    </div>
+                    @if (editMode)
+                    {
+                        <div class="resize-handle"></div>
+                    }
+                </div>
+            }
+
+            @if (buckets.Count == 0 && !editMode)
+            {
+                <p class="map-empty">No buckets yet. Click <strong>Edit buckets</strong> to draw some on the map.</p>
+            }
+        </div>
+    </main>
+</div>
+
+@code {
+    private const long MaxImageBytes = 20 * 1024 * 1024;
+
+    private List<Plan> plans = [];
+    private int planId;
+    private string editPlanName = "";
+
+    private List<Person> people = [];
+    private List<Bucket> buckets = [];
+    private Dictionary<int, int> assignments = []; // person id -> bucket id, for the current plan
+    private DateTime? imageVersion;
+
+    private string newPersonName = "";
+    private string filter = "";
+    private bool editMode;
+    private string? errorMessage;
+
+    private int? selectedBucketId;
+    private string editName = "";
+    private int editCapacity;
+    private string editColor = "";
+
+    private ElementReference mapElement;
+    private IJSObjectReference? module;
+    private DotNetObjectReference<Home>? selfRef;
+
+    private int? BucketOf(Person p) => assignments.TryGetValue(p.Id, out var bucketId) ? bucketId : null;
+
+    private IEnumerable<Person> UnplacedPeople => people
+        .Where(p => BucketOf(p) == null)
+        .Where(p => filter.Length == 0 || p.Name.Contains(filter, StringComparison.CurrentCultureIgnoreCase));
+
+    private int OverfilledCount => buckets.Count(b => assignments.Values.Count(id => id == b.Id) > b.Capacity);
+
+    private Bucket? SelectedBucket => buckets.FirstOrDefault(b => b.Id == selectedBucketId);
+
+    // CSS needs '.' as decimal separator regardless of the server culture.
+    private static string Pct(double value) => value.ToString("0.###", CultureInfo.InvariantCulture) + "%";
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadPlans(selectPlanId: null);
+        await Reload();
+        imageVersion = await Planner.GetMapImageVersionAsync();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            selfRef = DotNetObjectReference.Create(this);
+            module = await JS.InvokeAsync<IJSObjectReference>("import", "./js/map.js?v=4");
+            await module.InvokeVoidAsync("initMap", mapElement, selfRef);
+        }
+    }
+
+    private async Task Reload()
+    {
+        people = await Planner.GetPeopleAsync();
+        buckets = await Planner.GetBucketsAsync(planId);
+        assignments = await Planner.GetAssignmentsAsync(planId);
+    }
+
+    // ---- Plans (versions) ----
+
+    private async Task LoadPlans(int? selectPlanId)
+    {
+        plans = await Planner.GetPlansAsync();
+        var current = plans.FirstOrDefault(p => p.Id == selectPlanId) ?? plans[0];
+        planId = current.Id;
+        editPlanName = current.Name;
+    }
+
+    private async Task SwitchPlan(int id)
+    {
+        if (id == planId) return;
+        await LoadPlans(id);
+        selectedBucketId = null;
+        await Reload();
+    }
+
+    private async Task NewPlan()
+    {
+        var plan = await Planner.CreatePlanFromAsync(planId);
+        await LoadPlans(plan.Id);
+        selectedBucketId = null;
+        await Reload();
+    }
+
+    private async Task RenamePlan()
+    {
+        if (string.IsNullOrWhiteSpace(editPlanName))
+        {
+            editPlanName = plans.First(p => p.Id == planId).Name;
+            return;
+        }
+        await Planner.RenamePlanAsync(planId, editPlanName);
+        await LoadPlans(planId);
+    }
+
+    private async Task DeletePlan()
+    {
+        if (plans.Count <= 1) return;
+        var name = plans.First(p => p.Id == planId).Name;
+        if (!await JS.InvokeAsync<bool>("confirm", $"Delete \"{name}\" and all its buckets and placements?")) return;
+
+        await Planner.DeletePlanAsync(planId);
+        await LoadPlans(selectPlanId: null);
+        selectedBucketId = null;
+        await Reload();
+    }
+
+    // ---- People ----
+
+    private async Task AddPerson()
+    {
+        if (string.IsNullOrWhiteSpace(newPersonName)) return;
+        await Planner.AddPersonAsync(newPersonName);
+        newPersonName = "";
+        await Reload();
+    }
+
+    private async Task DeletePerson(int personId)
+    {
+        await Planner.DeletePersonAsync(personId);
+        await Reload();
+    }
+
+    // Called from people-dnd.js when a person is dropped on a bucket (or on the list, with null).
+    [JSInvokable]
+    public async Task DropPerson(int personId, int? fromBucketId, int? bucketId)
+    {
+        var person = people.FirstOrDefault(p => p.Id == personId);
+        if (person is null || BucketOf(person) == bucketId) return;
+
+        await Planner.AssignAsync(planId, personId, bucketId);
+        await Reload();
+        StateHasChanged();
+    }
+
+    // ---- Bucket editing ----
+
+    private void ToggleEditMode()
+    {
+        editMode = !editMode;
+        if (!editMode) selectedBucketId = null;
+    }
+
+    [JSInvokable]
+    public async Task CreateBucket(double x, double y, double width, double height)
+    {
+        var bucket = await Planner.CreateBucketAsync(planId, x, y, width, height);
+        await Reload();
+        Select(bucket.Id);
+        StateHasChanged();
+    }
+
+    [JSInvokable]
+    public async Task BucketPointerUp(int bucketId, double x, double y, double width, double height, bool moved)
+    {
+        if (moved)
+        {
+            await Planner.UpdateBucketRectAsync(bucketId, x, y, width, height);
+            await Reload();
+        }
+        Select(bucketId);
+        StateHasChanged();
+    }
+
+    [JSInvokable]
+    public void SelectBucket(int? bucketId)
+    {
+        Select(bucketId);
+        StateHasChanged();
+    }
+
+    private void Select(int? bucketId)
+    {
+        selectedBucketId = bucketId;
+        if (SelectedBucket is { } b)
+        {
+            editName = b.Name;
+            editCapacity = b.Capacity;
+            editColor = b.Color;
+        }
+    }
+
+    private async Task SaveBucketDetails()
+    {
+        if (selectedBucketId is not { } id) return;
+        if (string.IsNullOrWhiteSpace(editName)) editName = SelectedBucket?.Name ?? "Bucket";
+        editCapacity = Math.Max(0, editCapacity);
+        await Planner.UpdateBucketDetailsAsync(id, editName, editCapacity, editColor);
+        await Reload();
+    }
+
+    private async Task DeleteBucket(int bucketId)
+    {
+        await Planner.DeleteBucketAsync(bucketId);
+        selectedBucketId = null;
+        await Reload();
+    }
+
+    // ---- Map image ----
+
+    private async Task UploadImage(InputFileChangeEventArgs e)
+    {
+        errorMessage = null;
+        if (e.File.Size > MaxImageBytes)
+        {
+            errorMessage = "Image is too large (max 20 MB).";
+            return;
+        }
+
+        using var stream = new MemoryStream();
+        await e.File.OpenReadStream(MaxImageBytes).CopyToAsync(stream);
+        await Planner.SetMapImageAsync(stream.ToArray(), e.File.ContentType);
+        imageVersion = await Planner.GetMapImageVersionAsync();
+    }
+
+    private async Task ClearImage()
+    {
+        await Planner.ClearMapImageAsync();
+        imageVersion = null;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (module is not null)
+        {
+            try
+            {
+                await module.InvokeVoidAsync("dispose", mapElement);
+                await module.DisposeAsync();
+            }
+            catch (JSDisconnectedException)
+            {
+                // Circuit is gone; nothing to clean up in the browser.
+            }
+        }
+        selfRef?.Dispose();
+    }
+}

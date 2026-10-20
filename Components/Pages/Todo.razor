@@ -1,0 +1,428 @@
+@page "/opgaver"
+@page "/todo"
+@using System.Globalization
+@using Juleplanlaegning.Data
+@implements IAsyncDisposable
+@inject PlannerService Planner
+@inject TodoService Todos
+@inject IJSRuntime JS
+
+<PageTitle>Opgaver · Juleplanlægning</PageTitle>
+
+<div class="app">
+    <aside class="sidebar">
+        <h1>Juleplanlægning</h1>
+        <PageNav />
+
+        <section>
+            <h2>People</h2>
+            <form class="add-person" @onsubmit="AddPerson">
+                <input @bind="newPersonName" placeholder="Name" maxlength="200" />
+                <button type="submit" disabled="@string.IsNullOrWhiteSpace(newPersonName)">Add</button>
+            </form>
+            <input class="filter" @bind="filter" @bind:event="oninput" placeholder="Filter people…" />
+
+            @* Drag-and-drop is handled in wwwroot/js/people-dnd.js, which calls DropPerson on drop.
+               Dropping a chip from a task here takes the person off that task. *@
+            <div class="people-list dropzone">
+                @foreach (var p in FilteredPeople)
+                {
+                    var count = TaskCount(p.Id);
+                    <div class="chip @(count == 0 ? "idle" : "")" draggable="true" data-person-id="@p.Id"
+                         title="@(count == 0 ? "No tasks" : $"{count} {(count == 1 ? "task" : "tasks")}")">
+                        <span>@p.Name</span>
+                        @if (count > 0)
+                        {
+                            <span class="chip-count">@count</span>
+                        }
+                    </div>
+                }
+                @if (!FilteredPeople.Any())
+                {
+                    <p class="hint">@(people.Count == 0 ? "Add some people above." : "No one matches the filter.")</p>
+                }
+            </div>
+            @if (listId is not null)
+            {
+                <p class="hint">Drag people onto a task. To take someone off, click <strong>Edit</strong> on the task first.</p>
+            }
+        </section>
+
+        @if (listId is not null)
+        {
+            <section class="stats">
+                <div>Done: <strong>@tasks.Count(t => t.Done)</strong> / @tasks.Count</div>
+                <div>Without a task: <strong>@people.Count(p => TaskCount(p.Id) == 0)</strong></div>
+                @if (DoubleBookedCount > 0)
+                {
+                    <div class="warn">⚠ @DoubleBookedCount @(DoubleBookedCount == 1 ? "person" : "people") double-booked</div>
+                }
+            </section>
+        }
+    </aside>
+
+    <main>
+        <nav class="plan-tabs">
+            @foreach (var list in lists)
+            {
+                <button class="plan-tab @(list.Id == listId ? "active" : "")" @onclick="() => SwitchList(list.Id)">@list.Name</button>
+            }
+            <button class="plan-tab add" @onclick="NewList">+ New list</button>
+        </nav>
+
+        @if (listId is null)
+        {
+            <p class="hint">No lists yet. Click <strong>+ New list</strong> to make one.</p>
+        }
+        else
+        {
+            <div class="toolbar">
+                <label class="inline-label">Name <input @bind="editListName" @bind:after="RenameList" maxlength="200" /></label>
+                <button class="danger" @onclick="DeleteList">Delete list</button>
+            </div>
+
+            <form class="task-form" @onsubmit="AddTask">
+                <input class="task-title-input" @bind="newTitle" placeholder="New task…" maxlength="500" />
+                <label>From <input type="time" value="@newStart" @onchange="e => newStart = e.Value as string ?? string.Empty" /></label>
+                <label>To <input type="time" value="@newEnd" @onchange="e => newEnd = e.Value as string ?? string.Empty" /></label>
+                <button type="submit" disabled="@string.IsNullOrWhiteSpace(newTitle)">Add task</button>
+            </form>
+            @if (errorMessage is not null)
+            {
+                <span class="error">@errorMessage</span>
+            }
+
+            <div class="tasks">
+                @foreach (var t in tasks)
+                {
+                    <div class="task dropzone @(t.Done ? "done" : "")" data-drop-id="@t.Id" @key="t.Id">
+                        @if (editingTaskId == t.Id)
+                        {
+                            <form class="task-row" @onsubmit="SaveTask">
+                                <input class="task-title-input" @bind="editTitle" maxlength="500" />
+                                <input type="time" value="@editStart" @onchange="e => editStart = e.Value as string ?? string.Empty" />
+                                <input type="time" value="@editEnd" @onchange="e => editEnd = e.Value as string ?? string.Empty" />
+                                <button type="submit" disabled="@string.IsNullOrWhiteSpace(editTitle)">Save</button>
+                                <button type="button" @onclick="CancelEdit">Cancel</button>
+                            </form>
+                        }
+                        else
+                        {
+                            <div class="task-row">
+                                <input type="checkbox" checked="@t.Done" title="Done"
+                                       @onchange="e => SetDone(t.Id, e.Value is true)" />
+                                <span class="task-time @(t.Start is null && t.End is null ? "none" : "")">@TimeRange(t)</span>
+                                <span class="task-title">@t.Title</span>
+                                <button @onclick="() => EditTask(t)">Edit</button>
+                                <button class="danger" @onclick="() => DeleteTask(t.Id)">Delete</button>
+                            </div>
+                        }
+
+                        <div class="task-people">
+                            @foreach (var tp in t.People.OrderBy(tp => tp.Person?.Name))
+                            {
+                                var conflict = conflicts.GetValueOrDefault((t.Id, tp.PersonId));
+                                @* People can only be taken off (× or dragged away) while the task is being edited. *@
+                                var editing = editingTaskId == t.Id;
+                                <div class="chip @(conflict is null ? "" : "conflict") @(editing ? "" : "locked")"
+                                     draggable="@(editing ? "true" : "false")" data-person-id="@(editing ? tp.PersonId : null)"
+                                     title="@(conflict is null ? null : $"Also on \"{conflict}\" at the same time")">
+                                    <span>@(conflict is null ? "" : "⚠ ")@tp.Person?.Name</span>
+                                    @if (editing)
+                                    {
+                                        <button class="chip-delete" title="Take off this task" @onclick="() => RemovePerson(t.Id, tp.PersonId)">×</button>
+                                    }
+                                </div>
+                            }
+                            @{ var available = people.Where(p => t.People.All(tp => tp.PersonId != p.Id)).ToList(); }
+                            @if (available.Count > 0)
+                            {
+                                <select class="add-to-task" @onchange="e => AddPersonFromSelect(t.Id, e)">
+                                    <option value="">+ Add person</option>
+                                    @foreach (var p in available)
+                                    {
+                                        <option value="@p.Id" @key="p.Id">@p.Name</option>
+                                    }
+                                </select>
+                            }
+                        </div>
+                    </div>
+                }
+                @if (tasks.Count == 0)
+                {
+                    <p class="hint">No tasks yet. Add one above.</p>
+                }
+            </div>
+        }
+    </main>
+</div>
+
+@code {
+    private List<TodoList> lists = [];
+    private int? listId;
+    private string editListName = "";
+
+    private List<Person> people = [];
+    private List<TodoTask> tasks = [];
+    // (task id, person id) -> title of another task in this list the person is on at an overlapping time.
+    private Dictionary<(int TaskId, int PersonId), string> conflicts = [];
+
+    private string newPersonName = "";
+    private string filter = "";
+
+    private string newTitle = "";
+    // Times are bound as the browser's raw text and only parsed on add/save: browsers differ in
+    // whether they include seconds, and a failed parse during binding would blank the field.
+    private string newStart = "";
+    private string newEnd = "";
+    private string? errorMessage;
+
+    private int? editingTaskId;
+    private string editTitle = "";
+    private string editStart = "";
+    private string editEnd = "";
+
+    private IJSObjectReference? module;
+    private DotNetObjectReference<Todo>? selfRef;
+    private int dndToken;
+
+    private IEnumerable<Person> FilteredPeople => people
+        .Where(p => filter.Length == 0 || p.Name.Contains(filter, StringComparison.CurrentCultureIgnoreCase));
+
+    private int DoubleBookedCount => conflicts.Keys.Select(k => k.PersonId).Distinct().Count();
+
+    private int TaskCount(int personId) => tasks.Count(t => t.People.Any(tp => tp.PersonId == personId));
+
+    private static string TimeRange(TodoTask t) => (t.Start, t.End) switch
+    {
+        ({ } s, { } e) => $"{s:HH\\:mm}–{e:HH\\:mm}",
+        ({ } s, null) => $"{s:HH\\:mm}",
+        (null, { } e) => $"until {e:HH\\:mm}",
+        _ => "Any time",
+    };
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadLists(selectListId: null);
+        await Reload();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            selfRef = DotNetObjectReference.Create(this);
+            // Same URL as map.js imports, so both pages share one module instance.
+            module = await JS.InvokeAsync<IJSObjectReference>("import", "./js/people-dnd.js?v=1");
+            dndToken = await module.InvokeAsync<int>("initPeopleDragDrop", selfRef);
+        }
+    }
+
+    private async Task Reload()
+    {
+        people = await Planner.GetPeopleAsync();
+        tasks = listId is { } id ? await Todos.GetTasksAsync(id) : [];
+        conflicts = FindConflicts(tasks);
+    }
+
+    private static Dictionary<(int, int), string> FindConflicts(List<TodoTask> tasks)
+    {
+        var result = new Dictionary<(int, int), string>();
+        var timed = tasks.Where(t => t.Start is not null && t.End is not null).ToList();
+        foreach (var a in timed)
+        foreach (var b in timed)
+        {
+            if (a.Id == b.Id || !(a.Start < b.End && b.Start < a.End)) continue;
+            foreach (var tp in a.People.Where(tp => b.People.Any(o => o.PersonId == tp.PersonId)))
+            {
+                result.TryAdd((a.Id, tp.PersonId), b.Title);
+            }
+        }
+        return result;
+    }
+
+    // ---- Lists ----
+
+    private async Task LoadLists(int? selectListId)
+    {
+        lists = await Todos.GetListsAsync();
+        var current = lists.FirstOrDefault(l => l.Id == selectListId) ?? lists.FirstOrDefault();
+        listId = current?.Id;
+        editListName = current?.Name ?? "";
+    }
+
+    private async Task SwitchList(int id)
+    {
+        if (id == listId) return;
+        await LoadLists(id);
+        editingTaskId = null;
+        errorMessage = null;
+        await Reload();
+    }
+
+    private async Task NewList()
+    {
+        var list = await Todos.CreateListAsync();
+        await LoadLists(list.Id);
+        editingTaskId = null;
+        await Reload();
+    }
+
+    private async Task RenameList()
+    {
+        if (listId is not { } id) return;
+        if (string.IsNullOrWhiteSpace(editListName))
+        {
+            editListName = lists.First(l => l.Id == id).Name;
+            return;
+        }
+        await Todos.RenameListAsync(id, editListName);
+        await LoadLists(id);
+    }
+
+    private async Task DeleteList()
+    {
+        if (listId is not { } id) return;
+        var name = lists.First(l => l.Id == id).Name;
+        if (!await JS.InvokeAsync<bool>("confirm", $"Delete \"{name}\" and all its tasks?")) return;
+
+        await Todos.DeleteListAsync(id);
+        await LoadLists(selectListId: null);
+        editingTaskId = null;
+        await Reload();
+    }
+
+    // ---- Tasks ----
+
+    private async Task AddTask()
+    {
+        if (listId is not { } id || string.IsNullOrWhiteSpace(newTitle)) return;
+        if (!TryParseTimes(newStart, newEnd, out var start, out var end)) return;
+
+        await Todos.AddTaskAsync(id, newTitle, start, end);
+        newTitle = "";
+        // Tasks are often back to back, so suggest the next one starts when this one ends.
+        if (end is not null)
+        {
+            newStart = FormatTime(end);
+            newEnd = "";
+        }
+        await Reload();
+    }
+
+    private void EditTask(TodoTask t)
+    {
+        editingTaskId = t.Id;
+        editTitle = t.Title;
+        editStart = FormatTime(t.Start);
+        editEnd = FormatTime(t.End);
+        errorMessage = null;
+    }
+
+    private void CancelEdit()
+    {
+        editingTaskId = null;
+        errorMessage = null;
+    }
+
+    private async Task SaveTask()
+    {
+        if (editingTaskId is not { } id || string.IsNullOrWhiteSpace(editTitle)) return;
+        if (!TryParseTimes(editStart, editEnd, out var start, out var end)) return;
+
+        await Todos.UpdateTaskAsync(id, editTitle, start, end);
+        editingTaskId = null;
+        await Reload();
+    }
+
+    private static readonly string[] TimeFormats = ["HH:mm", "HH:mm:ss", "HH:mm:ss.FFF"];
+
+    private static string FormatTime(TimeOnly? time) => time?.ToString("HH:mm", CultureInfo.InvariantCulture) ?? "";
+
+    private static TimeOnly? ParseTime(string text) =>
+        TimeOnly.TryParseExact(text.Trim(), TimeFormats, CultureInfo.InvariantCulture, DateTimeStyles.None, out var time)
+            ? time
+            : null;
+
+    private bool TryParseTimes(string startText, string endText, out TimeOnly? start, out TimeOnly? end)
+    {
+        start = ParseTime(startText);
+        end = ParseTime(endText);
+        if ((start is null && !string.IsNullOrWhiteSpace(startText)) || (end is null && !string.IsNullOrWhiteSpace(endText)))
+            errorMessage = "Couldn't read the time. Use hours and minutes, e.g. 14:30.";
+        else if (start is not null && end is not null && end < start)
+            errorMessage = "The end time is before the start time.";
+        else
+            errorMessage = null;
+        return errorMessage is null;
+    }
+
+    private async Task SetDone(int taskId, bool done)
+    {
+        await Todos.SetTaskDoneAsync(taskId, done);
+        await Reload();
+    }
+
+    private async Task DeleteTask(int taskId)
+    {
+        await Todos.DeleteTaskAsync(taskId);
+        if (editingTaskId == taskId) editingTaskId = null;
+        await Reload();
+    }
+
+    // ---- People ----
+
+    private async Task AddPerson()
+    {
+        if (string.IsNullOrWhiteSpace(newPersonName)) return;
+        await Planner.AddPersonAsync(newPersonName);
+        newPersonName = "";
+        await Reload();
+    }
+
+    private async Task AddPersonFromSelect(int taskId, ChangeEventArgs e)
+    {
+        if (!int.TryParse(e.Value?.ToString(), out var personId)) return;
+        await Todos.AddPersonAsync(taskId, personId);
+        await Reload();
+    }
+
+    private async Task RemovePerson(int taskId, int personId)
+    {
+        if (taskId != editingTaskId) return;
+        await Todos.RemovePersonAsync(taskId, personId);
+        await Reload();
+    }
+
+    // Called from people-dnd.js. Ids are task ids; null means the people list.
+    // List -> task adds the person, task -> task moves them, task -> list takes them off.
+    // Only people on the task being edited can be dragged away from it.
+    [JSInvokable]
+    public async Task DropPerson(int personId, int? fromTaskId, int? toTaskId)
+    {
+        if (fromTaskId == toTaskId || people.All(p => p.Id != personId)) return;
+        if (fromTaskId is not null && fromTaskId != editingTaskId) return;
+        if (toTaskId is { } to && tasks.Any(t => t.Id == to)) await Todos.AddPersonAsync(to, personId);
+        if (fromTaskId is { } from) await Todos.RemovePersonAsync(from, personId);
+
+        await Reload();
+        StateHasChanged();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (module is not null)
+        {
+            try
+            {
+                await module.InvokeVoidAsync("disposePeopleDragDrop", dndToken);
+                await module.DisposeAsync();
+            }
+            catch (JSDisconnectedException)
+            {
+                // Circuit is gone; nothing to clean up in the browser.
+            }
+        }
+        selfRef?.Dispose();
+    }
+}
